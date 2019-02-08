@@ -1,5 +1,5 @@
 from __future__ import print_function
-import argparse
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -9,8 +9,26 @@ from torchvision import datasets, transforms
 import torch
 from torch import nn
 from torch import optim
+import pdb
 
 import syft as sy
+"""
+def mnist():
+    device = torch.device("cuda") # if use_cuda else "cpu")
+    kwargs = {'num_workers': 1, 'pin_memory': True, 'batch_size': 256 }
+    train_loader = torch.utils.data.DataLoader( datasets.MNIST('../data',
+        train=True, download=True, transform=data_transforms()), shuffle=True, **kwargs)
+    test_loader = torch.utils.data.DataLoader( datasets.MNIST('../data',
+        train=False, transform=data_transforms()), shuffle=True, **kwargs)
+
+    model = Net().to(device)
+    optimizer = optim.SGD(model.parameters(), lr=0.1, momentum=0.9)
+    epochs = 1
+    for epoch in range(1, epochs + 1):
+        train(model, device, train_loader, optimizer, epoch)
+        test(model, device, test_loader)
+"""
+
 
 class Net(nn.Module):
     def __init__(self):
@@ -60,71 +78,18 @@ def test(model, device, test_loader):
         test_loss, correct, len(test_loader.dataset),
         100. * correct / len(test_loader.dataset)))
 
+def distribute_dataset(data, workers):
+    batch_size = int(data.shape[0] / len(workers))
+    n_batches = len(workers)
+    for batch_i in range(n_batches - 1):
+        batch = data[batch_i * batch_size : (batch_i + 1) * batch_size]
+        ptr = batch.send(workers[batch_i])
+        ptr.child.garbage_collect_data = False
 
-def train_me():
-    # A Toy Dataset
-    data = torch.tensor([[0,0],[0,1],[1,0],[1,1.]], requires_grad=True)
-    target = torch.tensor([[0],[0],[1],[1.]], requires_grad=True)
+    batch = data[(n_batches - 1) * batch_size :]
+    ptr = batch.send(workers[n_batches - 1])
+    ptr.child.garbage_collect_data = False
 
-    # A Toy Model
-    model = nn.Linear(2,1)
-
-    # Training Logic
-    opt = optim.SGD(params=model.parameters(),lr=0.1)
-    for iter in range(20):
-
-        # 1) erase previous gradients (if they exist)
-        opt.zero_grad()
-
-        # 2) make a prediction
-        pred = model(data)
-
-        # 3) calculate how much we missed
-        loss = ((pred - target)**2).sum()
-
-        # 4) figure out which weights caused us to miss
-        loss.backward()
-
-        # 5) change those weights
-        opt.step()
-
-        # 6) print our progress
-        print(loss.data)
-
-
-
-    #train()
-    hook = sy.TorchHook(torch)
-
-
-
-    bob = sy.VirtualWorker(hook, id="bob")
-    alice = sy.VirtualWorker(hook, id="alice")
-
-    # A Toy Dataset
-    data = torch.tensor([[0,0],[0,1],[1,0],[1,1.]], requires_grad=True)
-    target = torch.tensor([[0],[0],[1],[1.]], requires_grad=True)
-
-    # get pointers to training data on each worker by
-    # sending some training data to bob and alice
-    data_bob = data[0:2]
-    target_bob = target[0:2]
-
-    data_alice = data[2:]
-    target_alice = target[2:]
-
-    # Iniitalize A Toy Model
-    model = nn.Linear(2,1)
-
-    data_bob = data_bob.send(bob)
-    data_alice = data_alice.send(alice)
-    target_bob = target_bob.send(bob)
-    target_alice = target_alice.send(alice)
-
-    # organize pointers into a list
-    datasets = [(data_bob,target_bob),(data_alice,target_alice)]
-
-    opt = optim.SGD(params=model.parameters(),lr=0.1)
 
 def data_transforms():
     return transforms.Compose([
@@ -132,39 +97,25 @@ def data_transforms():
                         transforms.Normalize((0.1307,), (0.3081,))
                     ])
 
-def build_loaders():
-    kwargs = {'num_workers': 1, 'pin_memory': True, 'batch_size': 256 }
-    train_loader = torch.utils.data.DataLoader( datasets.MNIST('../data',
-        train=True, download=True, transform=data_transforms()), shuffle=True, **kwargs)
-    test_loader = torch.utils.data.DataLoader( datasets.MNIST('../data',
-        train=False, transform=data_transforms()), shuffle=True, **kwargs)
-    return train_loader, test_loader
-
-def mnist():
-    device = torch.device("cuda") # if use_cuda else "cpu")
-    kwargs = {'num_workers': 1, 'pin_memory': True, 'batch_size': 256 }
-    train_loader = torch.utils.data.DataLoader( datasets.MNIST('../data',
-        train=True, download=True, transform=data_transforms()), shuffle=True, **kwargs)
-    test_loader = torch.utils.data.DataLoader( datasets.MNIST('../data',
-        train=False, transform=data_transforms()), shuffle=True, **kwargs)
-
-    model = Net().to(device)
-    optimizer = optim.SGD(model.parameters(), lr=0.1, momentum=0.9)
-    epochs = 1
-    for epoch in range(1, epochs + 1):
-        train(model, device, train_loader, optimizer, epoch)
-        test(model, device, test_loader)
-
+def build_datasets():
+    train = datasets.MNIST('../data', train=True, download=True, transform=data_transforms())
+    test = datasets.MNIST('../data', train=False, transform=data_transforms())
+    return train, test
 
 def mnist_fl():
-    device = torch.device("cuda") # if use_cuda else "cpu")
-    train_loader, test_loader = build_loaders()
     hook = sy.TorchHook(torch)
-
+    device = torch.device("cuda")
+    train, test  = build_datasets()
     bob = sy.VirtualWorker(hook, id="bob")
     alice = sy.VirtualWorker(hook, id="alice")
-    print(bob, alice)
+    andrew = sy.VirtualWorker(hook, id="andrew")
 
+    print(alice._objects)
+    for idx, tensor in enumerate(train):
+        if idx < 1:
+            print(tensor[0].shape)
+            tensor[0].send(alice)
+    print(alice._objects)
 
 if __name__ == '__main__':
     mnist_fl()
