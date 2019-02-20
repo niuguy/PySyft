@@ -201,9 +201,9 @@ def main():
 
     clients = [FederatedLearningClient(id=f"worker-{idx}", server_uri='ws://localhost:8765', hook=hook) for idx in np.arange(num_workers)]
 
-#    for client in clients:
-#        client.connect_to_federator()
-#        asyncio.get_event_loop().run_until_complete(client.participate_in_round())
+    for client in clients:
+        client.connect_to_federator()
+        asyncio.get_event_loop().run_until_complete(client.participate_in_round())
 #
 #        def fo():
 #            loop = asyncio.new_event_loop()
