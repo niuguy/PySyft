@@ -143,17 +143,38 @@ class TorchTensor(AbstractTensor):
         else:
             self._id = new_id
 
+    def _is_parameter(self):
+        """
+        Utility method to test if the tensor is in fact a Parameter
+        """
+        return isinstance(self, syft.hook.torch.nn.Parameter)
+
     @classmethod
     def handle_func_command(cls, command):
         """
-        Receive an instruction for a function to be applied on a torch
-        tensor, which can be a "real" tensor or just a wrapper at the
-        top of a chain (ex: wrapper>LoggingTensor>Torch tensor).
-        If this is not a wrapper layer, run the native torch command.
-        If this is a wrapper layer, just forward the instruction to the
-        next layer type in the chain (in the example above to LoggingTensor.
-        handle_method_command), get the response and replace a wrapper
-        on top of all tensors found in the response.
+        Operates as a router for functions. A function call always starts
+        by being handled here and 3 scenarii must be considered:
+
+        Real Torch tensor:
+            The arguments of the function are real tensors so we should
+            run the native torch command
+
+        Torch wrapper:
+            The arguments are just wrappers at the top of a chain
+            (ex: wrapper>LoggingTensor>Torch tensor), so just forward
+            the instruction to the next layer type in the chain (in
+            the example above to LoggingTensor.handle_func_command),
+            get the response and replace a wrapper on top of all tensors
+            found in the response.
+
+        Syft Tensor:
+            The arguments are syft tensors of same type: this can happen
+            if at any node of the chain where some function is forwarded,
+            the handle_func_command modify the function and make a new
+            call but keeps the arguments "un-wrapped". Making a new call
+            means that by default the command is treated here in the
+            global router.
+
         :param command: instruction of a function command: (command name,
         <no self>, arguments[, kwargs])
         :return: the response of the function command
@@ -163,13 +184,23 @@ class TorchTensor(AbstractTensor):
 
         try:  # will work if tensors are wrappers
             # Replace all torch tensor with their child attribute
-            new_args, new_type = syft.frameworks.torch.hook_args.hook_function_args(cmd, args)
+            # Note that we return also args_type which helps handling case 3 in the docstring
+            new_args, new_type, args_type = syft.frameworks.torch.hook_args.hook_function_args(
+                cmd, args, return_args_type=True
+            )
+            # This handles case 3: it redirects the command to the appropriate class depending
+            # of the syft type of the arguments and returns
+            if args_type not in (torch.Tensor, torch.nn.Parameter):
+                return args_type.handle_func_command(command)
+
             # build the new command
             new_command = (cmd, None, new_args)
             # Send it to the appropriate class and get the response
             response = new_type.handle_func_command(new_command)
             # Put back the wrappers where needed
-            response = syft.frameworks.torch.hook_args.hook_response(cmd, response, wrap_type=cls)
+            response = syft.frameworks.torch.hook_args.hook_response(
+                cmd, response, wrap_type=args_type
+            )
         except PureTorchTensorFoundError:  # means that it's not a wrapper but a pure tensor
             # TODO: clean this line
             cmd = (
@@ -188,7 +219,7 @@ class TorchTensor(AbstractTensor):
 
         return response
 
-    def send(self, *location):
+    def send(self, *location, inplace: bool = False):
         """Gets the pointer to a new remote object.
 
         One of the most commonly used methods in PySyft, this method serializes
@@ -200,6 +231,7 @@ class TorchTensor(AbstractTensor):
             location: The BaseWorker object which you want to send this object
                 to. Note that this is never actually the BaseWorker but instead
                 a class which instantiates the BaseWorker abstraction.
+            inplace: if true, return the same object instance, else a new wrapper
 
         Returns:
             A torch.Tensor[PointerTensor] pointer to self. Note that this
@@ -218,6 +250,8 @@ class TorchTensor(AbstractTensor):
 
             if hasattr(self, "child") and isinstance(self.child, PointerTensor):
                 self.child.garbage_collect_data = False
+                if self._is_parameter():
+                    self.data.child.garbage_collect_data = False
 
             ptr = self.owner.send(self, location)
 
@@ -236,13 +270,24 @@ class TorchTensor(AbstractTensor):
             # the same pointer which was previously created
             self.ptr = weakref.ref(ptr)
 
-            if isinstance(self, syft.hook.torch.nn.Parameter):
-                self.data.set_()
-                self.data = ptr
-                output = self
-
+            if self._is_parameter():
+                if inplace:
+                    self.data.set_()
+                    self.data = ptr
+                    output = self
+                else:
+                    wrapper = torch.Tensor()
+                    param_wrapper = torch.nn.Parameter(wrapper)
+                    param_wrapper.data.set_()
+                    param_wrapper.data = ptr
+                    output = param_wrapper
             else:
-                output = ptr.wrap()
+                if inplace:
+                    self.set_()
+                    self.child = ptr
+                    return self
+                else:
+                    output = ptr.wrap()
 
             if self.requires_grad:
 
@@ -268,6 +313,17 @@ class TorchTensor(AbstractTensor):
             ).wrap()
 
         return output
+
+    def send_(self, *location):
+        """
+        Calls send() with inplace option, but only with a single location
+        :param location: workers locations
+        :return:
+        """
+        if len(location) > 1:
+            raise NotImplementedError("Inplace send to several workers is currently not reported.")
+
+        return self.send(*location, inplace=True)
 
     def create_pointer(
         self,
@@ -374,8 +430,24 @@ class TorchTensor(AbstractTensor):
         del self.owner._objects[tensor.id]
         self.owner._objects[child_id] = tensor
 
-    def get(self, *args, deregister_ptr: bool = True, **kwargs):
+    def remote_get(self):
+        """Assuming .child is a PointerTensor, this method calls .get() on the tensor
+        that the .child is pointing to (which should also be a PointerTensor)
+
+        TODO: make this kind of message forwarding generic?
+        """
+
+        location = self.child.location
+        self.owner.send_command(message=("mid_get", self.child, ()), recipient=location)
+
+        return self
+
+    def get(self, *args, inplace: bool = False, **kwargs):
         """Requests the tensor/chain being pointed to, be serialized and return
+            args:
+                args: args to forward to worker
+                inplace: if true, return the same object instance, else a new wrapper
+                kwargs: kwargs to forward to worker
         """
         # Transfer the get() to the child attribute which is a pointer
 
@@ -400,15 +472,30 @@ class TorchTensor(AbstractTensor):
         # optimizer to lose track of where the actual weights
         # are.
         if isinstance(self, torch.nn.Parameter):
-            self.data = tensor.data
-            self.grad = tensor.grad
-            return self
+            if inplace:
+                self.data = tensor.data
+                self.grad = tensor.grad
+                return self
+            else:
+                return tensor
 
-        return tensor
+        if inplace:
+            self.set_(tensor)
+            if hasattr(tensor, "child"):
+                self.child = tensor.child
+            return self
+        else:
+            return tensor
+
+    def get_(self, *args, **kwargs):
+        """
+        Calls get() with inplace option set to True
+        """
+        return self.get(*args, inplace=True, **kwargs)
 
     def move(self, location):
         ptr = self.send(location)
-        self.owner.send_command(message=("mid_get", ptr, ()), recipient=location)
+        ptr.remote_get()
         self.child.location = location
         self.child.id_at_location = ptr.child.id_at_location
         # don't want it to accidentally delete the remote object
@@ -432,13 +519,37 @@ class TorchTensor(AbstractTensor):
     def float_prec(self):
         return self.child.float_precision()
 
-    def fix_prec(self):
+    float_precision = float_prec
+
+    def float_prec_(self):
+        tensor = self.float_prec()
+        if hasattr(tensor, "child"):
+            self.child = tensor.child
+        elif self._is_parameter():
+            self.data = tensor
+        else:
+            del self.child
+            self.set_(tensor)
+        return self
+
+    float_precision_ = float_prec_
+
+    def fix_prec(self, *args, **kwargs):
         return (
-            syft.frameworks.torch.tensors.interpreters.FixedPrecisionTensor()
+            syft.frameworks.torch.tensors.interpreters.FixedPrecisionTensor(*args, **kwargs)
             .on(self)
             .enc_fix_prec()
             .wrap()
         )
+
+    fix_precision = fix_prec
+
+    def fix_prec_(self, *args, **kwargs):
+        tensor = self.fix_prec(*args, **kwargs)
+        self.child = tensor.child
+        return self
+
+    fix_precision_ = fix_prec_
 
     def share(self, *owners):
         """This is a passthrough method which calls .share on the child.

@@ -331,7 +331,9 @@ def _simplify_torch_parameter(param: torch.nn.Parameter) -> bin:
 
     grad = param.grad
 
-    if grad is not None:
+    if grad is not None and not (
+        hasattr(grad, "child") and isinstance(grad.child, sy.PointerTensor)
+    ):
         grad_ser = _simplify_torch_tensor(grad)
     else:
         grad_ser = None
@@ -351,13 +353,15 @@ def _detail_torch_parameter(worker: AbstractWorker, param_tuple: tuple) -> torch
     Returns:
         torch.Parameter: a torch Parameter that was serialized
     """
-
     param_id, tensor_ser, requires_grad, grad_ser = param_tuple
 
     tensor = _detail_torch_tensor(worker, tensor_ser)
 
     if grad_ser is not None:
         grad = _detail_torch_tensor(worker, grad_ser)
+        grad.garbage_collect_data = False
+    elif hasattr(tensor, "child") and isinstance(tensor.child, sy.PointerTensor):
+        grad = tensor.attr("grad")
     else:
         grad = None
 
@@ -699,8 +703,16 @@ def _simplify_ellipsis(e: Ellipsis) -> bytes:
     return b""
 
 
+def _simplify_torch_device(device: torch.device) -> Tuple[str]:
+    return device.type
+
+
 def _detail_ellipsis(worker: AbstractWorker, ellipsis: bytes) -> Ellipsis:
     return ...
+
+
+def _detail_torch_device(worker: AbstractWorker, device_type: str) -> torch.device:
+    return torch.device(type=device_type)
 
 
 def _simplify_pointer_tensor(ptr: PointerTensor) -> tuple:
@@ -899,8 +911,9 @@ simplifiers = {
     numpy.ndarray: [7, _simplify_ndarray],
     slice: [8, _simplify_slice],
     type(Ellipsis): [9, _simplify_ellipsis],
-    PointerTensor: [10, _simplify_pointer_tensor],
-    LoggingTensor: [11, _simplify_log_tensor],
+    torch.device: [10, _simplify_torch_device],
+    PointerTensor: [11, _simplify_pointer_tensor],
+    LoggingTensor: [12, _simplify_log_tensor],
 }
 
 
@@ -940,6 +953,7 @@ detailers = [
     _detail_ndarray,
     _detail_slice,
     _detail_ellipsis,
+    _detail_torch_device,
     _detail_pointer_tensor,
     _detail_log_tensor,
 ]
