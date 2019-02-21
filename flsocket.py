@@ -1,5 +1,5 @@
 import time
-import time
+import json
 import os
 import asyncio
 import websockets
@@ -83,6 +83,18 @@ def start_server():
 
 
 
+class SocketThreader (threading.Thread):
+   def __init__(self, id, participant):
+      threading.Thread.__init__(self)
+      self.thread_id = id
+      self.participant = participant
+
+   def run(self):
+      print ("Starting " + self.thread_id)
+
+
+
+
 class FederatedLearningServer:
     def __init__(self, id, connection_params, hook):
         self.port = connection_params['port']
@@ -91,24 +103,10 @@ class FederatedLearningServer:
         self.worker = sy.VirtualWorker(hook, id=id, verbose=True)
         self.current_status = 'waiting_for_clients'
         self.connected_clients = set()
+        self.msg_queue = asyncio.Queue()
 
     def load_data(self, obj):
         self.worker.register_obj(obj)
-
-    def unregister(self, websocket):
-        self.connected_clients.remove(websocket)
-
-    async def register(self, websocket):
-        # Register.
-        self.connected_clients.add(websocket)
-        try:
-            # Implement logic here.
-            await asyncio.wait([ws.send("Hello!") for ws in self.connected_clients])
-            await asyncio.sleep(1)
-        finally:
-            self.connected_clients.remove(websocket)
-#            self.unregister(websocket)
-
 
     async def notify_state():
         if self.connected_clients:
@@ -116,45 +114,50 @@ class FederatedLearningServer:
             await asyncio.wait([client.send(message) for client in self.connected_clients])
 
     async def responder(self, websocket, path):
-        # register(websocket) sends user_event() to websocket
         self.connected_clients.add(websocket)
         try:
-            await websocket.send(self.current_status)
+            #await websocket.send(self.current_status)
             async for message in websocket:
                 data = json.loads(message)
+                if data['action'] == 'st':
+                    for cl in self.connected_clients:
+                        cl.send("OH HAI")
                 if data['action'] == 'SIGN_UP_FOR_ROUND':
                     await self.current_status
-                else:
-                    logging.error( "unsupported event: {}", data)
         finally:
             pass
 
+
+
+    async def handler(websocket, path):
+        print("Got a new connection...")
+        consumer_task = asyncio.ensure_future(consumer_handler(websocket))
+        producer_task = asyncio.ensure_future(producer_handler(websocket))
+
+        done, pending = await asyncio.wait([consumer_task, producer_task]
+                                        , return_when=asyncio.FIRST_COMPLETED)
+        print("Connection closed, canceling pending tasks")
+        for task in pending:
+            task.cancel()
+
+
     def start(self):
-        async def echo(websocket, path):
-            async for message in websocket:
-                print(f'RCV[{self.id}]: {message}')
-                time.sleep(.1)
-                await websocket.send(message)
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         asyncio.get_event_loop().run_until_complete(websockets.serve(self.responder, self.host, self.port))
+
         print("Starting Federator...\n")
         asyncio.get_event_loop().run_forever()
 
 
-    def start_round(self):
-        print(self.connected_clients)
-        for cl in self.connected_clients:
-            cl.send("OH HAI")
-        print("foo")
-
 class FederatedLearningClient:
-    def __init__(self, id, server_uri, hook, protocol='websocket'):
+    def __init__(self, id, server_uri, hook, loop, protocol='websocket'):
         self.id = id
         self.server_uri = server_uri
         self.worker = sy.VirtualWorker(hook, id=id, verbose=True)
         self.websocket = None
-        self.loop = asyncio.get_event_loop()
+        self.loop = loop
+        self.msg_queue = asyncio.Queue()
 
     def load_data(self, obj):
         self.worker.register_obj(obj)
@@ -163,17 +166,44 @@ class FederatedLearningClient:
         yield from websockets.connect(self.server_uri)
 
     async def consumer_handler(self):
-        async with websockets.connect(self.server_uri) as websocket:
-            result = await websocket.recv()
-            print(f'[{self.id}] - signing up. got {result}')
+        print('consumer')
+        result = await self.websocket.recv()
+        print(f'[{self.id}] - got {result}')
 
+    async def producer_handler(self):
+        while True:
+            message = await self.msg_queue.get()
+            print(f'[{self.id}] - sending {message}')
+            await self.websocket.send(message)
 
+    async def handler(self):
+        consumer_task = asyncio.ensure_future(self.consumer_handler())
+        producer_task = asyncio.ensure_future(self.producer_handler())
+        done, pending = await asyncio.wait(
+            [consumer_task, producer_task],
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        for task in pending:
+            task.cancel()
 
     async def participate_in_round(self):
         async with websockets.connect(self.server_uri) as websocket:
+            self.websocket = websocket
             websocket.send({ 'action': 'SIGN_UP_FOR_ROUND' })
             result = await websocket.recv()
             print(f'[{self.id}] - signing up. got {result}')
+            await self.handler()
+
+
+
+async def repl():
+    async with websockets.connect('ws://localhost:8765') as websocket:
+        while True:
+            cmd = input("cmd:  ")
+            await websocket.send(json.dumps({ 'action': str(cmd) }))
+            resp = await websocket.recv()
+            print("> {}".format(resp))
+
 
 def main():
     hook = sy.TorchHook(torch)
@@ -190,35 +220,24 @@ def main():
     num_workers = 3
     xs = [ [] for _ in np.arange(num_workers) ]
     ys = [ [] for _ in np.arange(num_workers) ]
-    print("Loading training set...")
     for idx in np.arange(10):
         (tensor, lbl) = train[idx]
         bucket = idx % num_workers
         xs[bucket].append(tensor)
         ys[bucket].append(lbl)
 
+    for idx in np.arange(num_workers):
+        def doobab():
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            client = FederatedLearningClient(id=f"worker-{idx}", server_uri='ws://localhost:8765', loop=loop, hook=hook)
+#            client.participate_in_round()
+    #        client.connect_to_federator()
+            loop.run_until_complete(client.connect_to_federator())
+        thread = Thread(target=doobab)
+        thread.start()
 
+    asyncio.get_event_loop().run_until_complete(repl())
 
-    clients = [FederatedLearningClient(id=f"worker-{idx}", server_uri='ws://localhost:8765', hook=hook) for idx in np.arange(num_workers)]
-
-    for client in clients:
-        client.connect_to_federator()
-        asyncio.get_event_loop().run_until_complete(client.participate_in_round())
-#
-#        def fo():
-#            loop = asyncio.new_event_loop()
-#            asyncio.set_event_loop(loop)
-#            asyncio.get_event_loop().run_until_complete(client.consumer_handler())
-#        Thread(target=fo).start()
-
-    while True:
-        choice = input(">> ")
-        try:
-            if choice == "s":
-                server.start_round()
-        except (ValueError, IndexError):
-            pass
-"""
-"""
 if __name__ == "__main__":
     main()
