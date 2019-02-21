@@ -51,12 +51,13 @@ def main():
     start_proc(FederatedLearningServer, kwargs)
     time.sleep(1)
 
-
     train, test  = build_datasets()
     num_workers = 3
+    data_sent = 10
     xs = [ [] for _ in np.arange(num_workers) ]
     ys = [ [] for _ in np.arange(num_workers) ]
-    for idx in np.arange(10):
+    # for now, we save ourselves the trouble of loading ALL the MNIST data:
+    for idx in np.arange(data_sent):
         (tensor, lbl) = train[idx]
         bucket = idx % num_workers
         xs[bucket].append(tensor)
